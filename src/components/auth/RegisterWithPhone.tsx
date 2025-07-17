@@ -4,6 +4,59 @@ import { useAuth } from '../../contexts/AuthContext';
 import { supabase } from '../../lib/supabase';
 import { useObserveLandingStore } from '../stores/LandingStore';
 
+// Função para enviar SMS via Twilio
+const sendSMSVerification = async (phone: string, code: string) => {
+  try {
+    // Primeiro, tentar usar o servidor real
+    try {
+      const response = await fetch('http://localhost:3001/api/send-sms', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          to: phone,
+          message: `Seu código de verificação é: ${code}. Válido por 30 minutos.`
+        })
+      });
+
+      if (response.ok) {
+        const result = await response.json();
+        console.log('✅ SMS enviado via servidor:', result);
+        return result;
+      }
+    } catch (serverError) {
+      console.log('❌ Servidor não encontrado, usando mock...');
+    }
+
+    // FALLBACK: Mock do SMS para desenvolvimento
+    if (import.meta.env.DEV) {
+      console.log('🚧 === MODO DESENVOLVIMENTO: SMS MOCK ===');
+      console.log('📞 Para:', phone);
+      console.log('🔑 Código:', code);
+      console.log('💬 Mensagem:', `Seu código de verificação é: ${code}. Válido por 30 minutos.`);
+      console.log('⚠️  Use este código na tela de verificação ⚠️');
+      console.log('===============================================');
+      
+      // Simular delay da API
+      await new Promise(resolve => setTimeout(resolve, 1500));
+      
+      return {
+        success: true,
+        message: 'SMS enviado com sucesso (MOCK)',
+        sid: 'mock_' + Date.now(),
+        status: 'sent',
+        mock: true
+      };
+    }
+
+    throw new Error('Servidor SMS não encontrado');
+  } catch (error) {
+    console.error('Erro ao enviar SMS:', error);
+    throw error;
+  }
+};
+
 interface RegisterWithPhoneProps {
   onSuccess: (userData?: any) => void;
   onBack: () => void;
@@ -24,6 +77,11 @@ export default function RegisterWithPhone({ onSuccess, onBack }: RegisterWithPho
     verificationCode: ''
   });
   const [showPassword, setShowPassword] = useState(false);
+  const [verificationData, setVerificationData] = useState({
+    code: '',
+    expiresAt: '',
+    attempts: 0
+  });
 
   const handleInputChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const { name, value } = e.target;
@@ -62,15 +120,25 @@ export default function RegisterWithPhone({ onSuccess, onBack }: RegisterWithPho
       if (!/^\(\d{2}\) \d{5}-\d{4}$/.test(formData.phone)) {
         throw new Error('Telefone inválido. Use o formato (99) 99999-9999');
       }
-  
-      // Register user with Supabase
-      const { error } = await signUp(formData.email, formData.password, formData.fullName);
-  
-      if (error) {
-        throw new Error(error.message);
+
+      // Validate email format
+      const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+      if (!emailRegex.test(formData.email)) {
+        throw new Error('Email inválido');
       }
-      
-      // Send verification code
+
+      // Validate password length
+      if (formData.password.length < 6) {
+        throw new Error('A senha deve ter pelo menos 6 caracteres');
+      }
+
+      // Check if email already exists
+      const { data: existingUser } = await supabase.auth.getUser();
+      if (existingUser.user && existingUser.user.email === formData.email) {
+        throw new Error('Este email já está em uso');
+      }
+
+      // Send verification code via SMS (without creating account yet)
       await sendVerificationCode();
 
       // Move to verification step
@@ -83,23 +151,9 @@ export default function RegisterWithPhone({ onSuccess, onBack }: RegisterWithPho
   };
 
   const sendVerificationCode = async () => {
-    if (!formData.email) return;
+    if (!formData.phone) return;
 
     try {
-      // Get user profile
-      const { data: profiles, error: profileError } = await supabase
-        .from('profiles')
-        .select('id, user_id')
-        .eq('email', formData.email)
-        .limit(1);
-
-      if (profileError) throw profileError;
-      if (!profiles || profiles.length === 0) {
-        throw new Error('Perfil não encontrado');
-      }
-
-      const userId = profiles[0].user_id;
-
       // Generate a random 6-digit code
       const code = Math.floor(100000 + Math.random() * 900000).toString();
 
@@ -107,27 +161,27 @@ export default function RegisterWithPhone({ onSuccess, onBack }: RegisterWithPho
       const expiresAt = new Date();
       expiresAt.setMinutes(expiresAt.getMinutes() + 30);
 
-      // Update profile with phone and verification data
-      const { error: updateError } = await supabase
-        .from('profiles')
-        .update({
-          phone: formData.phone,
-          phone_verification_code: code,
-          phone_verification_expires: expiresAt.toISOString(),
-          phone_verification_attempts: 0,
-          phone_verification_status: 'pending'
-        })
-        .eq('user_id', userId);
+      // Store verification data in component state (not in database yet)
+      setVerificationData({
+        code,
+        expiresAt: expiresAt.toISOString(),
+        attempts: 0
+      });
 
-      if (updateError) throw updateError;
+      // Convert phone format for Twilio (+55 11 99999-9999)
+      const phoneForTwilio = formData.phone
+        .replace(/\D/g, '') // Remove all non-digits
+        .replace(/^(\d{2})(\d{5})(\d{4})$/, '+55$1$2$3'); // Add +55 country code
 
-      // In a real app, this would send an SMS via Twilio
-      console.log(`Verification code for ${formData.phone}: ${code}`); // For demo purposes only
+      console.log('Enviando SMS para:', phoneForTwilio); // Debug log
 
-      setSuccess('Código de verificação enviado para seu telefone.');
+      // Send SMS via Twilio (mock ou real)
+      await sendSMSVerification(phoneForTwilio, code);
+
+      setSuccess('Código de verificação enviado para seu telefone via SMS.');
     } catch (err) {
       console.error('Error sending verification code:', err);
-      throw new Error('Erro ao enviar código de verificação');
+      throw new Error('Erro ao enviar código de verificação por SMS');
     }
   };
 
@@ -141,57 +195,66 @@ export default function RegisterWithPhone({ onSuccess, onBack }: RegisterWithPho
         throw new Error('O código deve ter 6 dígitos');
       }
 
-      // Get user profile
-      const { data: profiles, error: profileError } = await supabase
-        .from('profiles')
-        .select('id, user_id, phone_verification_code, phone_verification_expires, phone_verification_attempts')
-        .eq('email', formData.email)
-        .limit(1);
-
-      if (profileError) throw profileError;
-      if (!profiles || profiles.length === 0) {
-        throw new Error('Perfil não encontrado');
-      }
-
-      const profile = profiles[0];
-
       // Check if code has expired
-      if (profile.phone_verification_expires && new Date(profile.phone_verification_expires) < new Date()) {
+      if (verificationData.expiresAt && new Date(verificationData.expiresAt) < new Date()) {
         throw new Error('Código expirado. Solicite um novo código.');
       }
 
       // Check if too many attempts
-      if (profile.phone_verification_attempts >= 5) {
+      if (verificationData.attempts >= 5) {
         throw new Error('Muitas tentativas. Solicite um novo código.');
       }
 
       // Increment attempts
-      await supabase
-        .from('profiles')
-        .update({
-          phone_verification_attempts: (profile.phone_verification_attempts || 0) + 1
-        })
-        .eq('user_id', profile.user_id);
+      setVerificationData(prev => ({
+        ...prev,
+        attempts: prev.attempts + 1
+      }));
 
       // Check if code matches
-      if (profile.phone_verification_code !== formData.verificationCode) {
+      if (verificationData.code !== formData.verificationCode) {
         throw new Error('Código inválido. Tente novamente.');
       }
 
-      // Code is valid, mark phone as verified
-      const { error: updateError } = await supabase
+      // Code is valid, now create the account
+      const { error: signUpError } = await signUp(formData.email, formData.password, formData.fullName);
+
+      if (signUpError) {
+        throw new Error(signUpError.message);
+      }
+
+      // After successful signup, update the profile with phone verification
+      // Wait a bit for the profile to be created
+      await new Promise(resolve => setTimeout(resolve, 1000));
+
+      // Get the created user profile
+      const { data: profiles, error: profileError } = await supabase
         .from('profiles')
-        .update({
-          phone_verified: true,
-          phone_verification_status: 'verified',
-          phone_verification_code: null,
-          phone_verification_expires: null
-        })
-        .eq('user_id', profile.user_id);
+        .select('id, user_id')
+        .eq('email', formData.email)
+        .limit(1);
 
-      if (updateError) throw updateError;
+      if (profileError) {
+        console.error('Error fetching profile:', profileError);
+        // Don't throw here, account was created successfully
+      } else if (profiles && profiles.length > 0) {
+        // Update profile with phone verification data
+        const { error: updateError } = await supabase
+          .from('profiles')
+          .update({
+            phone: formData.phone,
+            phone_verified: true,
+            phone_verification_status: 'verified'
+          })
+          .eq('user_id', profiles[0].user_id);
 
-      setSuccess('Telefone verificado com sucesso!');
+        if (updateError) {
+          console.error('Error updating profile:', updateError);
+          // Don't throw here, account was created successfully
+        }
+      }
+
+      setSuccess('Telefone verificado e conta criada com sucesso!');
       
       setTimeout(() => {
         onSuccess({
@@ -213,7 +276,7 @@ export default function RegisterWithPhone({ onSuccess, onBack }: RegisterWithPho
 
     try {
       await sendVerificationCode();
-      setSuccess('Novo código de verificação enviado!');
+      setSuccess('Novo código de verificação enviado via SMS!');
     } catch (err) {
       setError((err as Error).message);
     } finally {
@@ -250,7 +313,7 @@ export default function RegisterWithPhone({ onSuccess, onBack }: RegisterWithPho
                   onChange={handleInputChange}
                   placeholder="Seu nome completo"
                   required
-                  className="w-full pl-10 pr-4 py-3 border border-gray-200 rounded-xl focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500 transition-colors duration-200 text-gray-100"
+                  className="w-full pl-10 pr-4 py-3 border border-gray-200 rounded-xl focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500 transition-colors duration-200"
                 />
               </div>
             </div>
@@ -266,7 +329,7 @@ export default function RegisterWithPhone({ onSuccess, onBack }: RegisterWithPho
                   onChange={handleInputChange}
                   placeholder="seu@email.com"
                   required
-                  className="w-full pl-10 pr-4 py-3 border border-gray-200 rounded-xl focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500 transition-colors duration-200 text-gray-100"
+                  className="w-full pl-10 pr-4 py-3 border border-gray-200 rounded-xl focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500 transition-colors duration-200"
                 />
               </div>
             </div>
@@ -280,13 +343,15 @@ export default function RegisterWithPhone({ onSuccess, onBack }: RegisterWithPho
                   name="phone"
                   value={formData.phone}
                   onChange={handleInputChange}
-                  placeholder="(99) 99999-9999"
+                  placeholder="(11) 99999-9999"
                   required
-                  className="w-full pl-10 pr-4 py-3 border border-gray-200 rounded-xl focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500 transition-colors duration-200 text-gray-100"
+                  className="w-full pl-10 pr-4 py-3 border border-gray-200 rounded-xl focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500 transition-colors duration-200"
                 />
               </div>
               <p className="text-xs text-gray-500 mt-1">
-                Você receberá um código de verificação neste número
+                <span className="text-blue-600">
+                  📱 O sistema tentará enviar SMS real primeiro, depois usará mock se necessário
+                </span>
               </p>
             </div>
 
@@ -302,7 +367,7 @@ export default function RegisterWithPhone({ onSuccess, onBack }: RegisterWithPho
                   placeholder="Sua senha"
                   required
                   minLength={6}
-                  className="w-full pl-10 pr-12 py-3 border border-gray-200 rounded-xl focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500 transition-colors duration-200 text-gray-100"
+                  className="w-full pl-10 pr-12 py-3 border border-gray-200 rounded-xl focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500 transition-colors duration-200"
                 />
                 <button
                   type="button"
@@ -321,11 +386,11 @@ export default function RegisterWithPhone({ onSuccess, onBack }: RegisterWithPho
                 className="w-full py-3 bg-blue-600 text-white rounded-xl hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed transition-all duration-200 font-medium flex items-center justify-center space-x-2 shadow-sm"
               >
                 {store.isLoading ? (
-                  <span>Processando...</span>
+                  <span>Enviando código via SMS...</span>
                 ) : (
                   <>
                     <Send className="h-4 w-4" />
-                    <span>Continuar</span>
+                    <span>Enviar Código SMS</span>
                   </>
                 )}
               </button>
@@ -348,7 +413,10 @@ export default function RegisterWithPhone({ onSuccess, onBack }: RegisterWithPho
           <div className="text-center mb-6">
             <h2 className="text-2xl font-bold text-gray-800">Verificar Telefone</h2>
             <p className="text-gray-600 mt-2">
-              Digite o código de 6 dígitos enviado para {formData.phone}
+              Digite o código de 6 dígitos enviado via SMS para {formData.phone}
+            </p>
+            <p className="text-sm text-blue-600 mt-2 font-medium">
+              💡 Se não recebeu SMS, verifique o console do navegador para o código mock
             </p>
           </div>
 
@@ -369,7 +437,7 @@ export default function RegisterWithPhone({ onSuccess, onBack }: RegisterWithPho
 
           <form onSubmit={handleVerifyCode} className="space-y-4">
             <div>
-              <label className="block text-sm font-medium text-gray-700 mb-1">Código de Verificação</label>
+              <label className="block text-sm font-medium text-gray-700 mb-1">Código de Verificação SMS</label>
               <input
                 type="text"
                 name="verificationCode"
@@ -386,15 +454,15 @@ export default function RegisterWithPhone({ onSuccess, onBack }: RegisterWithPho
               <button
                 type="submit"
                 disabled={store.isLoading || formData.verificationCode.length !== 6}
-                className="flex-1 py-3 bg-blue-600 text-white rounded-xl hover:bg-blue-700 transition-all duration-200 disabled:opacity-50 disabled:cursor-not-allowed shadow-sm"
+                className="w-full py-3 bg-blue-600 text-white rounded-xl hover:bg-blue-700 transition-all duration-200 disabled:opacity-50 disabled:cursor-not-allowed shadow-sm"
               >
-                {store.isLoading ? 'Verificando...' : 'Verificar e Criar Conta'}
+                {store.isLoading ? 'Verificando e criando conta...' : 'Verificar e Criar Conta'}
               </button>
             </div>
 
             <div className="text-center space-y-2">
               <p className="text-sm text-gray-600">
-                Não recebeu o código?
+                Não recebeu o SMS?
               </p>
               <button
                 type="button"
@@ -402,7 +470,7 @@ export default function RegisterWithPhone({ onSuccess, onBack }: RegisterWithPho
                 disabled={store.isLoading}
                 className="text-blue-600 hover:text-blue-700 text-sm font-medium transition-colors duration-200"
               >
-                Reenviar código
+                Reenviar código via SMS
               </button>
               <button
                 type="button"
